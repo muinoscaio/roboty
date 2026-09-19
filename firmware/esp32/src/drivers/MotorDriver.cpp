@@ -40,11 +40,7 @@ void MotorDriver::begin(uint32_t pwmFrequencyHz, uint8_t pwmResolutionBits) {
 
 void MotorDriver::setPercent(int percent) {
   percent = std::max(-100, std::min(100, percent));
-
-  const int effectivePercent = inverted_ ? -percent : percent_;
-  (void)effectivePercent;
-
-  int drivePercent = inverted_ ? -percent : percent;
+  const int drivePercent = inverted_ ? -percent : percent;
   percent_ = percent;
 
   if (drivePercent == 0) {
