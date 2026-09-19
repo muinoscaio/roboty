@@ -1,0 +1,33 @@
+name: firmware
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware.yml"
+  pull_request:
+    paths:
+      - "firmware/**"
+      - ".github/workflows/firmware.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: python -m pip install "platformio~=6.1"
+
+      - name: Build ESP32 firmware
+        run: pio run -d firmware/esp32
