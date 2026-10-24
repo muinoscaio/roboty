@@ -7,13 +7,39 @@ on:
       - "feat/**"
     paths:
       - "firmware/**"
+      - "tools/**"
+      - "tests/**"
       - ".github/workflows/firmware.yml"
   pull_request:
     paths:
       - "firmware/**"
+      - "tools/**"
+      - "tests/**"
       - ".github/workflows/firmware.yml"
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install host dependencies
+        run: python -m pip install -r tools/requirements.txt
+
+      - name: Test encoder, RPM, protocol and watchdog logic
+        env:
+          SANITIZE: "1"
+        run: python tests/run_native_tests.py
+
+      - name: Test host control and telemetry capture
+        run: python -m unittest discover -s tests/python -v
+
   build:
     runs-on: ubuntu-latest
 
@@ -27,7 +53,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install PlatformIO
-        run: python -m pip install "platformio~=6.1"
+        run: python -m pip install "platformio==6.1.19"
 
       - name: Build ESP32 firmware
         run: pio run -d firmware/esp32

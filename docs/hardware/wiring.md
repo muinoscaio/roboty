@@ -47,6 +47,10 @@ The firmware defaults to `RIGHT_INVERTED = true` because motors mounted on oppos
 7. Send `STOP`.
 8. Only then test on the floor.
 
-## M1 encoder note
+## M1 encoder wiring
 
-The next milestone adds quadrature encoders. Do not choose permanent encoder GPIO assignments until the exact motor/encoder model is purchased; some encoder boards require pull-ups or voltage adaptation.
+The firmware now supports quadrature encoders, but leaves them disabled with GPIOs unassigned. Confirm the exact motor/encoder model before choosing permanent encoder pins; some encoder boards require pull-ups or voltage adaptation.
+
+Follow the [encoder calibration guide](encoder-calibration.md) to verify signal levels, select four free GPIOs, enable acquisition, measure x4 counts per wheel revolution and check direction. Encoder polarity is configured independently of the motor's electrical inversion. Unknown CPR does not prevent tick telemetry; RPM remains unavailable until configured.
+
+The firmware rejects encoder pins shared between wheels or with the motor connections above, UART0 or boot straps. The GPIO driver also rejects unavailable/flash pins and attempts to use internal pull-ups on input-only pins. This software validation does not replace checking the actual board and encoder wiring.
