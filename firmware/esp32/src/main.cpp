@@ -2,6 +2,7 @@
 
 #include "comms/SerialCommandInterface.h"
 #include "config/RobotConfig.h"
+#include "config/VelocityConfig.h"
 #include "control/DifferentialDrive.h"
 #include "control/WheelSpeedEstimator.h"
 #include "drivers/MotorDriver.h"
@@ -86,13 +87,17 @@ void updateEncoders() {
   telemetry.rightTicks = right.ticks;
   telemetry.leftInvalid = left.invalidTransitions;
   telemetry.rightInvalid = right.invalidTransitions;
-  leftSpeed.update(left.ticks, now);
-  rightSpeed.update(right.ticks, now);
+  const bool sampledLeft = leftSpeed.update(left.ticks, now);
+  const bool sampledRight = rightSpeed.update(right.ticks, now);
   telemetry.leftDelta = leftSpeed.deltaTicks();
   telemetry.rightDelta = rightSpeed.deltaTicks();
   telemetry.leftRpm = leftSpeed.rpm();
   telemetry.rightRpm = rightSpeed.rpm();
   telemetry.sampleMs = leftSpeed.sampleMs();
+  if (sampledLeft && sampledRight) {
+    ++telemetry.sampleSequence;
+    telemetry.sampleAtMs = now;
+  }
 }
 
 }  // namespace
@@ -100,21 +105,15 @@ void updateEncoders() {
 void setup() {
   Serial.begin(roboty::config::SERIAL_BAUD);
   delay(250);
-
-  leftMotor.begin(
-      roboty::config::PWM_FREQUENCY_HZ,
-      roboty::config::PWM_RESOLUTION_BITS);
-
-  rightMotor.begin(
-      roboty::config::PWM_FREQUENCY_HZ,
-      roboty::config::PWM_RESOLUTION_BITS);
-
+  leftMotor.begin(roboty::config::PWM_FREQUENCY_HZ, roboty::config::PWM_RESOLUTION_BITS);
+  rightMotor.begin(roboty::config::PWM_FREQUENCY_HZ, roboty::config::PWM_RESOLUTION_BITS);
   drive.stop();
+  drive.configureVelocity(roboty::config::velocityConfig(), telemetry);
   commands.begin();
   beginEncoders();
 
   Serial.println();
-  Serial.println(F("Roboty M1 encoder rover ready (open-loop motor control)."));
+  Serial.println(F("Roboty M2 ready; open-loop commands retained; RPM control is opt-in."));
   Serial.println(F("Fail-safe: motors stop if motion commands are not refreshed."));
   commands.printHelp();
 }

@@ -46,6 +46,7 @@ class SerialCommandInterface {
 
   static void uppercase(char* text);
   static bool parseFloat(const char* token, float& value);
+  static bool parseNumber(const char* token, double& value);
   static bool parseInt(const char* token, int& value);
 };
 
