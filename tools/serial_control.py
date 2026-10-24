@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
-"""Interactive USB control with serialized writes and fail-safe shutdown."""
-
+"""Interactive USB control with serialized writes and optional same-port CSV logging."""
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
+import csv
 from dataclasses import dataclass
 import math
+from pathlib import Path
 import queue
 import re
 import sys
 import threading
 import time
-from typing import Callable
+from typing import Callable, TextIO
 
 import serial
-
+from telemetry_capture import FIELDS, _interval, parse_telemetry_line
 
 REFRESH_SECONDS = 0.20
 IO_TIMEOUT_SECONDS = 0.20
@@ -40,7 +42,6 @@ def _integer(token: str, minimum: int, maximum: int) -> int:
 
 
 def parse_command(line: str) -> Command:
-    """Validate a single firmware command before it can become a repeat command."""
     if not line.isascii() or any(ord(c) < 32 and c != "\t" for c in line) or "\x7f" in line:
         raise ValueError("Commands must be one ASCII line without control characters.")
     if len(line) > 95:
@@ -59,21 +60,23 @@ def parse_command(line: str) -> Command:
             raise ValueError("Usage: MOTOR <left -100..100> <right -100..100>")
         values = [_integer(value, -100, 100) for value in arguments]
         return Command(f"MOTOR {values[0]} {values[1]}", motion=True)
-    if name == "DRIVE":
+    if name in {"DRIVE", "RPM"}:
         if len(arguments) != 2:
-            raise ValueError("Usage: DRIVE <linear -1..1> <angular -1..1>")
+            raise ValueError(f"{name} requires two numbers.")
         try:
             values = [float(value) for value in arguments]
         except ValueError as exc:
-            raise ValueError("DRIVE requires two finite numbers between -1 and 1.") from exc
-        if any(not math.isfinite(value) or not -1 <= value <= 1 for value in values):
-            raise ValueError("DRIVE requires two finite numbers between -1 and 1.")
+            raise ValueError(f"{name} requires two finite numbers.") from exc
+        if any(not math.isfinite(value) for value in values):
+            raise ValueError(f"{name} requires two finite numbers.")
+        if name == "DRIVE" and any(not -1 <= value <= 1 for value in values):
+            raise ValueError("DRIVE values must be between -1 and 1.")
         if any("_" in value for value in arguments):
             raise ValueError("Numeric separators are not supported by the firmware.")
-        return Command("DRIVE " + " ".join(arguments), motion=True)
-    if name in {"STOP", "S", "STATUS", "HELP", "?"} and not arguments:
+        return Command(name + " " + " ".join(arguments), motion=True)
+    if name in {"STOP", "S", "STATUS", "HELP", "?", "CLEARFAULT"} and not arguments:
         name = {"S": "STOP", "?": "HELP"}.get(name, name)
-        return Command(name, stop=name == "STOP")
+        return Command(name, stop=name in {"STOP", "CLEARFAULT"})
     if name == "TELEMETRY" and len(arguments) <= 1:
         if not arguments:
             return Command(name)
@@ -86,8 +89,9 @@ def parse_command(line: str) -> Command:
 
 class CommandRefresher:
     """A single lock orders motion changes, query writes and the final STOP."""
-
     def __init__(self, connection: serial.Serial, refresh_seconds: float = REFRESH_SECONDS) -> None:
+        if not math.isfinite(refresh_seconds) or not 0 < refresh_seconds < 0.5:
+            raise ValueError("Refresh interval must be positive and below 0.5 seconds.")
         self.connection = connection
         self._refresh_seconds = refresh_seconds
         self._motion: str | None = None
@@ -145,7 +149,6 @@ class CommandRefresher:
         self.submit(command)
 
     def halt(self) -> None:
-        """Stop current motion while allowing later, explicit motion commands."""
         with self._lock:
             self._motion = None
             if not self._shutdown.is_set():
@@ -182,15 +185,16 @@ class CommandRefresher:
                         return
 
 
-def interactive_session(
-    connection: serial.Serial,
-    input_fn: Callable[[str], str] = input,
-    output: Callable[[str], None] = print,
-) -> int:
-    """Exit on I/O errors even when the terminal is waiting for user input."""
+def interactive_session(connection: serial.Serial, input_fn: Callable[[str], str] = input,
+                        output: Callable[[str], None] = print, *,
+                        telemetry_output: TextIO | None = None, telemetry_interval: int = 200) -> int:
+    """End refresh on I/O/log errors, even while the terminal waits for input."""
+    if type(telemetry_interval) is not int or not 50 <= telemetry_interval <= 5000:
+        raise ValueError("Telemetry interval must be between 50 and 5000 ms.")
     refresher = CommandRefresher(connection)
     finished = threading.Event()
     inputs: queue.Queue[str | Exception | None] = queue.Queue()
+    writer = csv.DictWriter(telemetry_output, fieldnames=FIELDS) if telemetry_output is not None else None
 
     def read_input() -> None:
         while not finished.is_set():
@@ -208,10 +212,16 @@ def interactive_session(
             try:
                 line = connection.readline(4096).decode("utf-8", errors="replace").rstrip()
                 if line:
-                    output(f"< {line}")
-                    if line.startswith(("ERR ", "WATCHDOG ")):
+                    if line.startswith(("ERR ", "WATCHDOG ")) or (line.startswith("Roboty ") and "ready" in line):
                         refresher.halt()
-            except (serial.SerialException, OSError) as exc:
+                    record = parse_telemetry_line(line)
+                    if record is not None and record["control_fault"] not in (None, "none"):
+                        refresher.halt()
+                    if record is not None and writer is not None:
+                        writer.writerow(record)
+                        telemetry_output.flush()
+                    output(f"< {line}")
+            except Exception as exc:
                 refresher.abort(exc)
                 return
 
@@ -219,6 +229,10 @@ def interactive_session(
     try:
         refresher.start()
         refresher.submit("STOP")
+        if writer is not None:
+            writer.writeheader()
+            telemetry_output.flush()
+            refresher.submit(f"TELEMETRY {telemetry_interval}")
         reader.start()
         threading.Thread(target=read_input, daemon=True).start()
         while not refresher.stopped:
@@ -241,10 +255,16 @@ def interactive_session(
                 output(f"Invalid command; motors stopped: {exc}")
     except KeyboardInterrupt:
         pass
-    except (serial.SerialException, OSError) as exc:
+    except Exception as exc:
         refresher.abort(exc)
     finally:
         finished.set()
+        if writer is not None and not refresher.stopped:
+            try:
+                refresher.halt()
+                refresher.submit("TELEMETRY 0")
+            except (serial.SerialException, OSError) as exc:
+                refresher.abort(exc)
         refresher.stop()
         if reader.ident is not None:
             reader.join(timeout=1.0)
@@ -258,20 +278,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Roboty USB serial controller")
     parser.add_argument("port", help="Serial port, e.g. COM5 or /dev/ttyUSB0")
     parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--telemetry-csv", type=Path, help="New CSV file for same-port control and telemetry")
+    parser.add_argument("--interval", type=_interval, default=200, metavar="MS")
     args = parser.parse_args(argv)
     if args.baud <= 0:
         parser.error("--baud must be positive")
     try:
-        with serial.Serial(args.port, args.baud, timeout=IO_TIMEOUT_SECONDS,
-                           write_timeout=IO_TIMEOUT_SECONDS) as connection:
+        with ExitStack() as stack:
+            log = stack.enter_context(args.telemetry_csv.open("x", newline="", encoding="utf-8")) if args.telemetry_csv else None
+            connection = stack.enter_context(serial.Serial(args.port, args.baud, timeout=IO_TIMEOUT_SECONDS,
+                                                            write_timeout=IO_TIMEOUT_SECONDS))
             time.sleep(1.0)
             print("Connected. Enter a firmware command; EXIT or Ctrl+C quits.")
-            print("Motion repeats until STOP, an invalid command, or an I/O error.")
+            print("Motion repeats until STOP, invalid input, a device restart, or an I/O error.")
             print("STATUS, HELP and TELEMETRY queries keep the current motion active.")
-            print("Examples: FWD 40 | LEFT 35 | DRIVE 0.5 0.2 | TELEMETRY 200 | STOP")
-            return interactive_session(connection)
+            print("Examples: FWD 40 | RPM 20 20 | STOP | CLEARFAULT | TELEMETRY 200")
+            return interactive_session(connection, telemetry_output=log, telemetry_interval=args.interval)
     except (serial.SerialException, OSError) as exc:
-        print(f"Serial connection failed: {exc}", file=sys.stderr)
+        print(f"Serial connection or log failed: {exc}", file=sys.stderr)
         return 1
 
 

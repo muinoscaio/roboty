@@ -32,26 +32,43 @@ Status: software implemented; configuration and measurement must be verified on 
 - [ ] Verify RPM against a physical reference and determine usable pulse throughput/noise limits.
 - [ ] Record a bench capture and results in the calibration checklist.
 
-Start with [encoder calibration](hardware/encoder-calibration.md). Current progress, verification commands and handoff notes are in the [M1 checkpoint](checkpoints/m1-encoder-telemetry.md).
+Start with [encoder calibration](hardware/encoder-calibration.md). The [M1 checkpoint](checkpoints/m1-encoder-telemetry.md) records the earlier implementation; PR #2 was integrated before M2.
 
 ## M2 — Closed-loop wheel control
 
-Next software milestone. Physical tuning depends on M1 bench evidence.
+Status: software implemented and CI-validated; opt-in remains disabled until real configuration. Hardware tuning and acceptance are not complete.
 
-- [ ] PID per wheel with output limits, anti-windup and clean disable/reset.
-- [ ] Target wheel RPM API and explicit control-mode state.
-- [ ] Bound speed targets using the actual motors and power supply.
-- [ ] Stop and clear controller state on watchdog expiry or unusable feedback.
-- [ ] Step-response telemetry with target/measured RPM and applied PWM.
-- [ ] Reproducible tuning procedure and saved calibration values.
-- [ ] Preserve raw PWM commands for diagnosis and recovery.
-- [ ] Validate tracking, reversals, stopping and stalled/absent feedback on a supported bench.
+- [x] Independent wheel PID with output caps, conditional-integration anti-windup, filtered derivative and clean reset.
+- [x] Signed wheel RPM targets and explicit stopped/open-loop/velocity modes.
+- [x] Configurable finite target/feedback RPM and PWM limits; unknown defaults fail closed.
+- [x] STOP/watchdog clear controller state, including while waiting for the first output.
+- [x] Latched faults for unavailable/stale/invalid feedback, sample timing and invalid encoder transitions.
+- [x] No-progress timeout for either targeted wheel; wrong-direction counts and repeating commands do not keep it alive.
+- [x] Explicit stopped-only fault acknowledgement; no automatic restart on feedback recovery.
+- [x] Preserve raw PWM diagnostics, blocked by a latched fault until acknowledged.
+- [x] Schema 2 telemetry: desired/measured RPM, commanded PWM, mode, fault and completed sample identity.
+- [x] Same-port interactive control and CSV logging; stop refresh on logging/I/O errors or observed restart.
+- [x] Native PID/synthetic-plant/protocol tests and host regression tests.
+- [x] CI compiles both default and enabled synthetic firmware without changing real defaults.
+- [x] Reproducible tuning guide and checkpoint with recovery references.
+- [ ] Select and record real gains, speed/PWM limits and timeouts for the purchased hardware.
+- [ ] Validate tracking, low-speed behavior, saturation recovery, stopping, reversals and feedback faults on a controlled bench.
+- [ ] Save measured configuration and captures with acceptance results.
+
+See [velocity tuning](hardware/velocity-tuning.md), [protocol](serial-protocol.md) and [M2 checkpoint](checkpoints/m2-wheel-velocity.md). Compiling or passing simulation tests does not close physical acceptance items.
 
 ## M3 — Odometry and IMU
 
-- [ ] Wheel odometry and robot physical-parameter configuration.
-- [ ] Timestamped pose/twist telemetry.
-- [ ] IMU integration and sensor calibration.
+Next implementation milestone. Mathematical tests can proceed independently of hardware; real dimensions and an actual IMU must not be invented.
+
+- [ ] Explicit per-wheel radius, wheel separation and calibrated CPR; disabled/unavailable odometry until configured.
+- [ ] Differential-drive pose/twist from cumulative signed count differences, with straight/arc/in-place rotation tests.
+- [ ] Timestamped odometry and sample identity without summing repeated streamed delta rows.
+- [ ] Reset/session semantics, duplicate/skipped sample handling, wrap and invalid-data tests.
+- [ ] Measured geometry and physical distance/rotation acceptance runs.
+- [ ] Identify the actual IMU, voltage/interface, mounting and driver requirements.
+- [ ] IMU integration, stationary bias calibration and documented fusion assumptions.
+- [ ] Preserve M0/M1/M2 stop/fault behavior and publish a continuation checkpoint.
 
 ## M4 — ROS 2 integration
 

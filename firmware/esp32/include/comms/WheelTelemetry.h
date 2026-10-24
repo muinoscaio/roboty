@@ -16,6 +16,8 @@ struct WheelTelemetry {
   uint32_t leftInvalid = 0;
   uint32_t rightInvalid = 0;
   uint32_t sampleMs = 0;
+  uint32_t sampleSequence = 0;
+  uint32_t sampleAtMs = 0;
 };
 
 }  // namespace roboty

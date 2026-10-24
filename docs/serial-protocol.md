@@ -1,64 +1,88 @@
 # USB serial protocol
 
-Roboty uses 115200 baud, ASCII commands and LF, CR or CRLF line endings. Command names are case-insensitive; spaces and tabs separate tokens. A line can contain at most 95 characters before its terminator. The boot banner, help, status, errors and JSON telemetry share the port.
+Roboty uses 115200 baud, ASCII commands and LF, CR or CRLF line endings. Command names are case-insensitive; spaces and tabs separate tokens. Lines contain at most 95 characters before the terminator. Boot/help/status/errors and JSON telemetry share the port.
 
 ## Commands
 
 | Command | Arguments | Behavior |
 |---|---|---|
-| `FWD` / `F` | Optional integer `0..100` | Both wheels forward |
-| `BACK` / `B` | Optional integer `0..100` | Both wheels backward |
+| `FWD` / `F` | Optional integer `0..100` | Open-loop forward |
+| `BACK` / `B` | Optional integer `0..100` | Open-loop backward |
 | `LEFT` / `L` | Optional integer `0..100` | Left backward, right forward |
 | `RIGHT` / `R` | Optional integer `0..100` | Left forward, right backward |
-| `DRIVE` | Two finite numbers `-1..1`: linear, angular | Mix and normalize wheel outputs; positive angular rotates left |
+| `DRIVE` | Two finite numbers `-1..1`: linear, angular | Open-loop normalized mixing; positive angular rotates left |
 | `MOTOR` | Two integers `-100..100`: left, right | Raw signed wheel PWM percentages |
-| `STOP` / `S` | None | Stop both wheels immediately |
-| `STATUS` | None | Print commanded PWM percentages and watchdog state |
-| `TELEMETRY` | None | Emit one JSON telemetry record |
-| `TELEMETRY` | Integer `50..5000` | Stream every N milliseconds |
+| `RPM` | Two finite numbers: left, right wheel RPM | Closed-loop targets, within configured magnitude limits |
+| `STOP` / `S` | None | Zero both outputs and reset controllers; preserve a latched fault |
+| `CLEARFAULT` | None | Acknowledge control fault while stopped; never start movement |
+| `STATUS` | None | Commanded PWM, watchdog state, mode, fault and targets |
+| `TELEMETRY` | None | Emit one JSON record |
+| `TELEMETRY` | Integer `50..5000` | Set streaming interval in milliseconds |
 | `TELEMETRY 0` | — | Disable streaming |
-| `HELP` / `?` | None | Print available commands |
+| `HELP` / `?` | None | Show help |
 
-Directional commands without a percentage use `DEFAULT_DRIVE_PERCENT`, initially 45. An explicitly invalid speed never falls back to that value. Extra arguments, unknown commands, out-of-range/nonfinite numbers and invalid control characters produce `ERR ...` and stop the motors. An overlong or binary-contaminated line is discarded through its terminator, so its tail cannot become a second motion command.
+Directional commands with no percentage use `DEFAULT_DRIVE_PERCENT`, initially 45. An invalid supplied speed never falls back to that value. Extra arguments, unknown commands, out-of-range/nonfinite numbers and invalid control characters produce `ERR ...` and stop the motors. An overlong or binary-contaminated line is discarded through its terminator so its tail cannot become another movement command.
 
-Valid motion commands refresh the 750 ms watchdog, including commands that set zero output. `STATUS`, `HELP`, telemetry configuration and telemetry output never extend the motion deadline. An expired active command emits `WATCHDOG stop: motion command expired`. The watchdog is checked before input processing, between received bytes and after telemetry; at most 64 input bytes are consumed per loop iteration. This is a cooperative software deadline, not an independent hardware emergency stop.
+## Modes, movement lease and faults
 
-The Python console repeats the active motion command every 200 ms. Queries preserve that repeat state. Invalid user input or a received firmware `ERR`/`WATCHDOG` cancels it and sends STOP. EOF, Ctrl+C, EXIT and serial failures end the session with a STOP attempt; if the connection is gone, the firmware watchdog stops the motors.
+Boot starts stopped. `RPM` requires deliberate opt-in, valid gains/limits, initialized encoders, configured CPR and a fresh completed sample. The shipped configuration rejects nonzero RPM targets. The first accepted nonzero target starts the movement lease even while PWM is initially zero awaiting a new sample.
 
-## Telemetry
+Only accepted motion commands refresh the 750 ms watchdog. Queries, streaming, fault acknowledgement and new encoder samples do not extend it. Zero-output/zero-target commands stop movement; `RPM 0 0` is accepted with closed-loop disabled when no fault is latched. Active expiry emits `WATCHDOG stop: motion command expired` and resets PID state as well as PWM. Later samples cannot revive the expired controller without a new motion command.
 
-Example only, showing a stationary rover with configured encoders:
+`MOTOR`, `DRIVE` and directional commands exit/reset velocity mode and retain their original ranges, outside M2 output/speed caps. A latched control fault blocks these commands too. Diagnose it using STATUS, correct the cause, then acknowledge with CLEARFAULT while stopped. A new command is required to move again. Attempting CLEARFAULT while movement is commanded is rejected and stops the motors; retry while stopped. Fault acknowledgement does not validate the physical cause or prove mechanical standstill.
 
-~~~json
-{"type":"telemetry","ms":1200,"encoders":true,"calibrated":true,"left_ticks":1440,"right_ticks":1440,"left_delta":0,"right_delta":0,"left_rpm":0,"right_rpm":0,"left_invalid":0,"right_invalid":0,"sample_ms":100,"left_pwm":0,"right_pwm":0,"motion_active":false}
+Mode strings are `stopped`, `open_loop` and `velocity`. Fault strings are `none`, `disabled`, `configuration`, `target_range`, `feedback_unavailable`, `stale_feedback`, `invalid_feedback`, `encoder_transition`, `no_motion`, `sample_timing` and `numeric`. See [velocity tuning](hardware/velocity-tuning.md) for their checks and limits.
+
+The watchdog runs before PID output, during bounded serial parsing and after telemetry. At most 64 input bytes are processed per poll. This remains a cooperative software deadline, not an independent hardware emergency stop.
+
+## Telemetry schema 2
+
+M2 retains M1 field names and adds explicit schema, sample and control fields:
+
+| Field | Meaning |
+|---|---|
+| `type` | Always `telemetry` |
+| `ms` | Unsigned 32-bit firmware uptime at emission |
+| `encoders` | Both encoder drivers initialized |
+| `calibrated` | Both CPR settings are positive and finite; **not** physical acceptance evidence |
+| `left_ticks`, `right_ticks` | Signed 64-bit quadrature x4 total counts |
+| `left_delta`, `right_delta` | Signed counts in the last completed speed window |
+| `left_rpm`, `right_rpm` | Signed measured wheel RPM for that window, or JSON `null` when unavailable |
+| `left_invalid`, `right_invalid` | Invalid quadrature-transition totals |
+| `sample_ms` | Duration of the last completed speed window; zero before the first sample |
+| `left_pwm`, `right_pwm` | Current commanded signed integer percentages, not current/voltage measurements |
+| `motion_active` | Whether a nonzero motion request is subject to the watchdog; can be true with PWM zero |
+| `schema_version` | `2` for M2; absent in M1 |
+| `sample_seq` | Unsigned 32-bit sequence, incremented once when both wheels complete a sample |
+| `sample_at_ms` | Unsigned 32-bit uptime at completion of that sample |
+| `control_mode` | `stopped`, `open_loop` or `velocity` |
+| `control_fault` | Latched control fault, or `none` |
+| `left_target_rpm`, `right_target_rpm` | Requested signed wheel RPM in velocity mode; zero outside it |
+
+The default speed window is 100 ms, independently of streaming interval. Counts and command state are current loop snapshots; RPM/delta describe the preceding completed window. A fast stream can repeat a sample and a slower stream can omit intermediate samples. **Do not sum delta columns.** Use cumulative tick differences for displacement and sample sequence/time for completed measurement windows.
+
+Encoder polarity is independent of motor electrical inversion. Missing CPR still permits counts; RPM stays null until both CPR values and a completed sample are available. Invalid-transition counters diagnose some signal issues, not every missed edge.
+
+`TELEMETRY N` acknowledges with `OK telemetry_interval_ms=N`; setting the interval does not reset ticks. STOP does not disable telemetry. Rebooting resets counts, sequence and uptime; 32-bit time/sequence also wrap. Compare data within a known uninterrupted boot, not blindly across file/session boundaries.
+
+## Python console and capture
+
+The console repeats a valid motion command every 200 ms. STATUS/HELP/TELEMETRY preserve the repeat state. Invalid input, received ERR/WATCHDOG, an observed ready banner or valid fault telemetry cancel it. CLEARFAULT clears host repeat state and is sent once, not repeated. EOF, Ctrl+C, EXIT, serial errors and CSV write errors stop refresh with a final STOP attempt. Lost USB means the firmware must enforce its lease.
+
+For powered bench measurements, use one connection for both control and logging:
+
+~~~bash
+python tools/serial_control.py COM5 --telemetry-csv pid-run-01.csv --interval 100
 ~~~
 
-| Field | Unit / meaning |
-|---|---|
-| `type` | Always `telemetry`; use this to distinguish records |
-| `ms` | Unsigned 32-bit `millis()` at emission, wrapping at 2^32 |
-| `encoders` | Both encoder drivers initialized successfully |
-| `calibrated` | Both counts-per-wheel-revolution settings are positive and finite; physical calibration is not certified by this flag |
-| `left_ticks`, `right_ticks` | Signed 64-bit x4 counts since encoder initialization |
-| `left_delta`, `right_delta` | Signed counts accumulated during the last completed speed-estimation window |
-| `left_rpm`, `right_rpm` | Signed wheel revolutions per minute; JSON `null` when unavailable |
-| `left_invalid`, `right_invalid` | Number of observed two-bit transitions discarded by each decoder |
-| `sample_ms` | Actual duration of the last completed speed window; zero before the first sample |
-| `left_pwm`, `right_pwm` | Commanded signed percentages, not measured wheel speed |
-| `motion_active` | Whether a nonzero commanded output is subject to the motion watchdog |
+The log must not already exist. Startup sends STOP and enables telemetry only; movement requires explicit input. Normal shutdown stops movement, disables the requested stream and attempts a final STOP. A connection error can prevent these writes.
 
-The default estimation window is 100 ms; streaming is independently configurable. Current ticks and emission time are sampled each loop, while delta/RPM/window duration describe the last completed speed sample. A 50 ms stream can therefore repeat the same speed sample. **Do not sum the delta columns across CSV rows.** Use differences of cumulative tick counts to measure displacement or calibrate counts per revolution.
-
-Encoder inversion is independent of motor inversion. A physically forward wheel should increase its encoder count after calibration. Missing calibration still permits tick acquisition; both RPM fields stay `null` until both CPR values are configured. Invalid-transition counts diagnose some signal problems but cannot prove that no edges were missed.
-
-`TELEMETRY <interval>` acknowledges with `OK telemetry_interval_ms=N`. Changing the interval starts a new telemetry scheduling period; it does not reset ticks. STOP does not turn off telemetry. Rebooting/reopening a reset-on-connect ESP32 restarts ticks and clock, so compare counts within one uninterrupted session.
-
-## CSV capture
+For passive/manual encoder work with motor power disconnected:
 
 ~~~bash
 python tools/telemetry_capture.py COM5 --output encoder-run.csv --interval 200 --duration 30
 ~~~
 
-The recorder validates the JSON fields, ignores boot/status messages and malformed records, and writes a header plus the fields listed above except `type`. Unavailable RPM becomes an empty cell. `--duration` is optional; otherwise Ctrl+C ends capture. The recorder disables telemetry on exit and never sends a motion command.
+The standalone recorder sends only telemetry commands and overwrites its chosen file. It cannot share the port with the console/monitor. Duration is optional; Ctrl+C ends capture otherwise. It attempts to disable streaming on exit.
 
-Use only one application on a serial port at a time. This recorder is intended for passive observation/manual encoder calibration; it cannot run simultaneously with the interactive controller on the same port. Close the controller or monitor before recording. The recorders' argument and I/O errors produce nonzero exit status.
+Both readers accept M1 and M2 JSON, ignore unrelated boot/status text and reject malformed/nonfinite records. CSV contains the telemetry fields except `type`; unavailable RPM is blank. M1 gets `schema_version=1` and blank new control/sample fields rather than invented targets. The console additionally reacts to firmware error lines and control faults as described above.

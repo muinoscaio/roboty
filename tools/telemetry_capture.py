@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Capture Roboty encoder telemetry to CSV without sending motion commands."""
-
+"""Capture Roboty encoder/control telemetry to CSV without sending motion commands."""
 from __future__ import annotations
 
 import argparse
@@ -14,17 +13,31 @@ from typing import Callable, TextIO
 
 import serial
 
-
-FIELDS = ("ms", "encoders", "calibrated", "left_ticks", "right_ticks",
-          "left_delta", "right_delta", "left_rpm", "right_rpm",
-          "left_invalid", "right_invalid", "sample_ms", "left_pwm",
-          "right_pwm", "motion_active")
+BASE_FIELDS = ("ms", "encoders", "calibrated", "left_ticks", "right_ticks",
+               "left_delta", "right_delta", "left_rpm", "right_rpm",
+               "left_invalid", "right_invalid", "sample_ms", "left_pwm",
+               "right_pwm", "motion_active")
+CONTROL_FIELDS = ("schema_version", "sample_seq", "sample_at_ms", "control_mode",
+                  "control_fault", "left_target_rpm", "right_target_rpm")
+FIELDS = BASE_FIELDS + CONTROL_FIELDS
 _UINT32_FIELDS = ("ms", "left_invalid", "right_invalid", "sample_ms")
 _INT64_FIELDS = ("left_ticks", "right_ticks", "left_delta", "right_delta")
+FAULTS = {"none", "disabled", "configuration", "target_range", "feedback_unavailable",
+          "stale_feedback", "invalid_feedback", "encoder_transition", "no_motion",
+          "sample_timing", "numeric"}
+
+
+def _finite_number(value: object) -> bool:
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def parse_telemetry_line(line: str | bytes) -> dict | None:
-    """Ignore boot messages and incomplete/malformed records, including NaN/Inf."""
+    """Validate M1 or M2 frames. Missing M1 control fields become blank CSV cells."""
     if isinstance(line, bytes):
         line = line.decode("utf-8", errors="replace")
     if not line.lstrip().startswith("{"):
@@ -35,32 +48,51 @@ def parse_telemetry_line(line: str | bytes) -> dict | None:
         return None
     if not isinstance(record, dict) or record.get("type") != "telemetry":
         return None
-    if any(field not in record for field in FIELDS):
+    if any(field not in record for field in BASE_FIELDS):
         return None
     if any(type(record[field]) is not bool for field in ("encoders", "calibrated", "motion_active")):
         return None
     for fields, minimum, maximum in (
-        (_UINT32_FIELDS, 0, 2**32 - 1),
-        (_INT64_FIELDS, -(2**63), 2**63 - 1),
+        (_UINT32_FIELDS, 0, 2**32 - 1), (_INT64_FIELDS, -(2**63), 2**63 - 1),
         (("left_pwm", "right_pwm"), -100, 100),
     ):
-        if any(type(record[field]) is not int or not minimum <= record[field] <= maximum
-               for field in fields):
+        if any(type(record[field]) is not int or not minimum <= record[field] <= maximum for field in fields):
             return None
     if record["calibrated"] and not record["encoders"]:
         return None
     for field in ("left_rpm", "right_rpm"):
         value = record[field]
-        if value is not None:
-            if type(value) not in (int, float):
-                return None
-            try:
-                if not math.isfinite(value):
-                    return None
-            except OverflowError:
-                return None
-            if not record["calibrated"] or record["sample_ms"] == 0:
-                return None
+        if value is not None and (not _finite_number(value) or not record["calibrated"] or record["sample_ms"] == 0):
+            return None
+    version = record.get("schema_version", 1)
+    if type(version) is not int or version not in (1, 2):
+        return None
+    if version == 2:
+        if any(field not in record for field in CONTROL_FIELDS):
+            return None
+        if any(type(record[field]) is not int or not 0 <= record[field] < 2**32
+               for field in ("sample_seq", "sample_at_ms")):
+            return None
+        if not isinstance(record["control_mode"], str) or record["control_mode"] not in {"stopped", "open_loop", "velocity"}:
+            return None
+        if not isinstance(record["control_fault"], str) or record["control_fault"] not in FAULTS:
+            return None
+        if any(not _finite_number(record[field]) for field in ("left_target_rpm", "right_target_rpm")):
+            return None
+        if record["control_mode"] == "velocity" and (
+            not record["encoders"] or not record["calibrated"] or record["sample_ms"] == 0 or
+            record["left_rpm"] is None or record["right_rpm"] is None or
+            not record["motion_active"] or record["control_fault"] != "none"
+        ):
+            return None
+        if record["control_fault"] != "none" and (
+            record["control_mode"] != "stopped" or record["motion_active"] or
+            record["left_pwm"] != 0 or record["right_pwm"] != 0
+        ):
+            return None
+    else:
+        record.update({field: None for field in CONTROL_FIELDS})
+        record["schema_version"] = 1
     return {field: record[field] for field in FIELDS}
 
 
@@ -70,13 +102,8 @@ def _send(connection: serial.Serial, command: str) -> None:
         raise serial.SerialTimeoutException("Incomplete serial write.")
 
 
-def capture(
-    connection: serial.Serial,
-    output: TextIO,
-    interval_ms: int = 200,
-    duration: float | None = None,
-    clock: Callable[[], float] = time.monotonic,
-) -> int:
+def capture(connection: serial.Serial, output: TextIO, interval_ms: int = 200,
+            duration: float | None = None, clock: Callable[[], float] = time.monotonic) -> int:
     if type(interval_ms) is not int or not 50 <= interval_ms <= 5000:
         raise ValueError("Telemetry interval must be between 50 and 5000 ms.")
     if duration is not None and (not math.isfinite(duration) or duration <= 0):
