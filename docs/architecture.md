@@ -1,53 +1,62 @@
 # Architecture
 
-Roboty separates GPIO, motion semantics, measurement and transport so each layer can evolve without introducing ROS dependencies into the motor driver.
+Roboty separates GPIO ownership, acquisition, measurement, control and transport. High-level features do not introduce ROS dependencies into embedded drivers.
 
-## M1 runtime
+## Runtime components
 
 | Layer | Components | Responsibility |
 |---|---|---|
-| Configuration | `RobotConfig.h` | Motor pins/polarity; encoder opt-in, pins, polarity, pull-ups, wheel CPR and sample interval |
-| Drivers | `MotorDriver`, `QuadratureEncoder` | TB6612 PWM/direction; two-channel GPIO acquisition and atomic encoder snapshots |
-| Control/measurement | `DifferentialDrive`, `QuadratureDecoder`, `WheelSpeedEstimator` | Motion mixing, x4 state transitions and elapsed-time wheel RPM |
-| Communication | `SerialCommandInterface`, `WheelTelemetry` | Command validation, motion watchdog, human-readable responses and JSON telemetry |
-| Host | `serial_control.py`, `telemetry_capture.py` | Repeating teleoperation commands or passive CSV recording |
+| Configuration | `RobotConfig.h`, `VelocityConfig.h` | Hardware mapping/CPR, opt-in, gains and limits |
+| Drivers | `MotorDriver`, `QuadratureEncoder` | TB6612 PWM/direction and protected encoder snapshots |
+| Acquisition/measurement | `QuadratureDecoder`, `WheelSpeedEstimator`, `WheelTelemetry` | x4 transitions, signed counts, elapsed-time RPM and sample identity |
+| Control | `WheelPid`, `VelocityControl`, `DifferentialDrive` | Per-wheel PID, feedback supervision, mode arbitration and output dispatch |
+| Transport | `SerialCommandInterface` | Strict commands, movement lease, status and JSON |
+| Host | `serial_control.py`, `telemetry_capture.py` | Ordered repeated commands, same-port control logging or passive capture |
 
-At startup, both motor outputs are zeroed. Encoders are initialized only if enabled and configured. Any encoder initialization failure removes handlers already installed by this startup path and reports `encoders=false`; M0 open-loop commands remain available.
+Startup zeroes both outputs, configures the velocity supervisor without starting it, and initializes encoders only when opted in. An encoder initialization failure rolls back installed handlers and reports unavailable feedback. Raw M0 movement remains available unless a control fault has subsequently latched.
 
-Each loop snapshots encoders, updates speed estimates if a window has elapsed, processes bounded serial input, checks the motion deadline and optionally emits telemetry. Only valid motion commands refresh the deadline. RPM measurement does not feed PWM in M1.
+Each loop snapshots counts, updates both speed estimators and publishes a sequence/timestamp when a sample completes. The serial interface checks its movement lease **before** requesting a PID update, then processes bounded input and telemetry. Only accepted motion commands renew the lease. A new velocity target waits for a new sample rather than integrating stale data immediately.
 
-## Encoder acquisition
+## Encoder boundary
 
-Both A and B channels interrupt on both edges, producing quadrature x4 counts. The Gray-code sequence `00 -> 01 -> 11 -> 10 -> 00` is positive before optional inversion. Repeated states do not count; a two-bit transition is recorded as invalid and resynchronizes to the observed state without inventing motion.
+Both A/B channels interrupt on both edges. `00 -> 01 -> 11 -> 10 -> 00` counts positively before inversion. Repeated states contribute nothing; two-bit transitions increment a diagnostic and resynchronize without inventing motion. Signed counts and invalid-transition counters saturate instead of overflowing.
 
-The ISR reads GPIO registers and updates the decoder under an ESP32 `portMUX`. Loop snapshots use the same mux, keeping 64-bit counts coherent. RPM calculation and serial formatting run outside the ISR. Signed counts and invalid-transition counters saturate at their type limits rather than overflowing.
+The ISR reads GPIO registers and updates the decoder under an ESP32 portMUX; snapshots use the same lock for coherent 64-bit reads. RPM and serial formatting stay outside the ISR. The handler/reader and inline decoder avoid a flash lookup table. The GPIO service is requested with `ESP_INTR_FLAG_IRAM`, but it is global: a service installed first by another component can have different dispatcher flags. Future interrupt users must review ownership and memory placement.
 
-The handler, register reader and inlined decoder use RAM-safe code without a flash lookup table. The driver asks the ESP-IDF GPIO service for `ESP_INTR_FLAG_IRAM`. That service is global: if future code installs it first with different flags, accepting an already-installed service does not guarantee its dispatcher runs during flash operations. Review service ownership before adding other GPIO-interrupt users. See [Espressif interrupt allocation](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-reference/system/intr_alloc.html) and [memory placement](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-guides/memory-types.html).
+References: Espressif [interrupt allocation](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-reference/system/intr_alloc.html) and [memory placement](https://docs.espressif.com/projects/esp-idf/en/v4.4.7/esp32/api-guides/memory-types.html). No software test establishes a lossless physical pulse rate or noise immunity; PCNT can replace the acquisition driver later without changing the cumulative-count contract.
 
-GPIO acquisition has a finite throughput and cannot reconstruct edges never observed. Test wiring noise and the maximum pulse rate on the actual hardware before relying on it for closed-loop motion. A later PCNT implementation can replace the driver without changing the measured-count contract.
+## Closed-loop boundary
 
-## Measurement and telemetry
+`WheelPid` is hardware-independent: input is wheel RPM and elapsed seconds; output is bounded signed PWM percent. It implements conditional integration, filtered derivative on measurement and optional feedforward. Output never opposes a nonzero target direction; zero and sign changes reset controller state. This is not an active braking or speed-qualified reversal system.
 
-CPR means x4 counts per wheel revolution, including gearbox reduction. Each wheel has its own value. `WheelSpeedEstimator` uses the actual elapsed unsigned millisecond interval, including clock wrap, and calculates signed RPM. Unknown/invalid CPR leaves counting active but makes RPM unavailable at the protocol boundary.
+`VelocityControl` owns two PIDs and a latched fault. It gates configuration and feedback, rejects stale/implausible/nonfinite data, checks sample sequence/duration, observes invalid quadrature transitions and times absence of count progress in the requested direction. Repeated or magnitude-adjusted targets do not renew that progress timer. Fresh sample sequence prevents integrating duplicate windows.
 
-`WheelTelemetry` contains measurement state; the command interface adds emission time and current commanded outputs. Tick counts are current snapshots; delta/RPM describe the last completed estimation window. See the [protocol](serial-protocol.md) for timing and null-value semantics.
+`DifferentialDrive` owns mode arbitration and is the only control layer dispatching to the motor drivers. Open-loop commands disable/reset velocity state. STOP resets state and PWM but not a fault. A fault blocks both velocity and raw commands until explicit acknowledgement while stopped; acknowledgement does not start movement. The RPM caps intentionally do not alter raw diagnostic command ranges.
 
-## Fail-safe ownership
+The serial layer owns the 750 ms movement lease for both raw and RPM commands. A nonzero RPM request is active even before its first nonzero PWM. Watchdog expiry clears target and controller state, so future samples alone cannot restart it.
 
-The firmware owns the movement deadline. The host refreshes motion but cannot extend its lifetime with status queries. Parsing failures stop PWM; overflow discards the entire remaining line. Input work is bounded to 64 bytes per poll, with watchdog checks interleaved.
+## Host and telemetry boundary
 
-The Python console uses one lock for repeat-state changes and serial writes. Final STOP and thread termination are ordered so an already-selected motion command cannot be written after shutdown's STOP. A timeout/disconnection ends refresh rather than silently continuing. These software mechanisms do not replace a physical motor-power disconnect.
+One host lock orders repeat-state changes, serial writes and final STOP. EOF, serial errors and received firmware faults stop refresh. Optional CSV output uses the same serial reader, avoiding competing applications on one port. Logging failures also abort the session. An observed ready banner cancels repetition, but there is no boot-ID handshake or guarantee of detecting every reset/lost message.
 
-## M2 extension point
+Schema 2 retains original measurements and adds targets, mode, fault, sample sequence and sample timestamp. Current command/PWM state and the preceding completed measurement window are distinct. Old M1 frames remain readable with blank missing control fields. See [protocol](serial-protocol.md) for exact semantics.
 
-Add per-wheel velocity targets and PID controllers between the command/motion layer and raw `MotorDriver` output. Preserve `MOTOR`/open-loop diagnostics and make STOP/watchdog clear PID state as well as PWM. Require verified encoder direction and CPR before enabling closed-loop operation. Firmware status must distinguish commanded PWM, target RPM and measured RPM.
+## Safety limits and verification
+
+Software tests cover control arithmetic, synthetic plant response, protocol/driver interaction, clock wrap, fault latching, STOP ordering and host error paths. CI also compiles default and synthetic opt-in configurations. Neither is a physical motor test.
+
+Firmware/watchdog scheduling is cooperative; physical shutdown, stopping distance, current limits, noise and actual gains remain bench responsibilities. No-motion monitoring can be fooled by false forward counts. Keep the defaults disabled until calibration and acceptance are recorded. See [velocity tuning](hardware/velocity-tuning.md).
+
+## Next boundary: M3
+
+Build odometry from cumulative wheel-count differences, not repeated telemetry delta rows or integrated streamed RPM. Keep wheel dimensions, separation and CPR explicit and unconfigured until measured. Add independent pose/sample identity, reset semantics and deterministic straight/arc/rotation/wrap tests. Preserve motor/watchdog ownership. Select an actual IMU before implementing its electrical driver; do not fabricate IMU data or calibration.
 
 ## Design rules
 
-1. High-level code never writes motor GPIO directly.
-2. Transport does not own mixing, encoder decoding or PID mathematics.
-3. Only motion commands may renew the motion deadline.
-4. New modes preserve a raw/open-loop diagnostic path.
-5. Physical dimensions and encoder resolution stay in configuration.
+1. Drivers own GPIO; transport does not own PID/kinematics mathematics.
+2. Only accepted motion commands renew the motion lease.
+3. Stop, fault, acknowledgement and physical acceptance are different states.
+4. Preserve a diagnostic raw mode without silently weakening fault latching.
+5. Physical parameters and real calibration evidence stay explicit.
 6. ROS types remain outside embedded drivers.
-7. Software tests and physical validation are recorded separately.
+7. Record software and hardware validation separately, with recoverable commits.
