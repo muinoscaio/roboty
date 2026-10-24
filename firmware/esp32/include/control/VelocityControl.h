@@ -98,8 +98,8 @@ class VelocityControl {
 
     // Observe total counts every loop, not just on PID samples. Repeating or
     // changing the magnitude of an RPM command must not renew these timers.
-    if (feedback.leftTicks != leftTicks_ || leftTarget_ == 0.0) leftMotionAt_ = now;
-    if (feedback.rightTicks != rightTicks_ || rightTarget_ == 0.0) rightMotionAt_ = now;
+    if (progressInDirection(feedback.leftTicks, leftTicks_, leftTarget_)) leftMotionAt_ = now;
+    if (progressInDirection(feedback.rightTicks, rightTicks_, rightTarget_)) rightMotionAt_ = now;
     leftTicks_ = feedback.leftTicks;
     rightTicks_ = feedback.rightTicks;
     if ((leftTarget_ != 0.0 && static_cast<uint32_t>(now - leftMotionAt_) >= config_.noMotionTimeoutMs) ||
@@ -177,6 +177,10 @@ class VelocityControl {
         std::fabs(f.leftRpm) > config_.maxFeedbackRpm ||
         std::fabs(f.rightRpm) > config_.maxFeedbackRpm) return VelocityFault::InvalidFeedback;
     return VelocityFault::None;
+  }
+
+  static bool progressInDirection(int64_t current, int64_t previous, double target) {
+    return target == 0.0 || (target > 0.0 ? current > previous : current < previous);
   }
 
   static void changeTarget(double next, double& previous, WheelPid& pid,

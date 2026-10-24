@@ -237,6 +237,18 @@ void target_range_and_fractional_pwm_limit() {
   assert(c.update(f, 200) && c.leftPercent() == 10 && c.rightPercent() == -10);
 }
 
+void opposite_encoder_direction_does_not_mask_no_motion() {
+  auto f = sample();
+  VelocityControl c(configuration());
+  assert(c.setTargets(20, -20, f, 100));
+  for (uint32_t t = 200; t <= 800; t += 100) {
+    advance(f, -1, 1); // Both encoder polarities are wrong for the targets.
+    assert(c.update(f, t));
+    assert(c.setTargets(20, -20, f, t));
+  }
+  assert(!c.update(f, 850) && c.fault() == VelocityFault::NoMotion);
+}
+
 void independent_wheel_gains() {
   auto cfg = configuration();
   cfg.left = {1, 0, 0, 0, .02};
@@ -283,7 +295,8 @@ int main() {
   skipped_backwards_and_inconsistent_samples_are_faults();
   millisecond_and_sample_sequence_wrap();
   target_range_and_fractional_pwm_limit();
+  opposite_encoder_direction_does_not_mask_no_motion();
   independent_wheel_gains();
   deterministic_plant_tracks_target_with_bounded_output();
-  std::cout << "velocity/PID tests passed (14 groups)\n";
+  std::cout << "velocity/PID tests passed (15 groups)\n";
 }
